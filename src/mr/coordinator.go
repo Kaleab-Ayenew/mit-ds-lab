@@ -8,11 +8,52 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync"
+	"time"
 )
+
+type mapFile struct {
+	Name       string
+	Locked     bool
+	AcquiredAt time.Time
+	TaskId     int
+}
 
 type Coordinator struct {
 	// Your definitions here.
-	files []string
+	files              []mapFile
+	TaskCounter        SafeCounter
+	ActiveMapWorkers   SafeCounter
+	MaxMapWorkers      int
+	ReduceWorkers      int
+	WorkerCounter      SafeCounter
+	IntermediateFiles  []string
+	MapTaskLockTimeout time.Duration
+	IsReduceCompleted  bool
+	mu                 sync.Mutex
+}
+
+type SafeCounter struct {
+	mu    sync.Mutex
+	value int
+}
+
+func (c *SafeCounter) Inc() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value++
+}
+
+func (c *SafeCounter) Dec() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value--
+}
+
+func (c *SafeCounter) Val() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.value
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -25,14 +66,47 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
-func (c *Coordinator) WorkerDone(task *TaskData, reply *CoordinatorReply) error {
-	c.files = removeByValueFast(c.files, task.Filename)
+func (c *Coordinator) WorkerDone(request *WorkerDoneRequest, reply *CoordinatorReply) error {
+	c.mu.Lock()
+	c.files = removeMapFileByName(c.files, request.Task.Filename)
+	c.mu.Unlock()
+	c.IntermediateFiles = append(c.IntermediateFiles, request.Inames...)
+	c.ActiveMapWorkers.Dec()
 	return nil
+}
+
+func (c *Coordinator) assignMapFile(TaskId int) (string, bool) {
+	now := time.Now()
+	for i := range c.files {
+		f := &c.files[i]
+		if !f.Locked {
+			f.Locked = true
+			f.AcquiredAt = now
+			f.TaskId = TaskId
+			return f.Name, true
+		}
+		if now.Sub(f.AcquiredAt) > c.MapTaskLockTimeout {
+			f.AcquiredAt = now
+			return f.Name, true
+		}
+	}
+	return "", false
 }
 
 // Get task RPC handler
 func (c *Coordinator) GetMapTask(worker *MapWorker, task *TaskData) error {
-	task.Filename = c.files[len(c.files)-1]
+	if c.ActiveMapWorkers.Val() >= c.MaxMapWorkers {
+		return nil
+	}
+	c.mu.Lock()
+	filename, ok := c.assignMapFile(c.TaskCounter.value)
+	task.TaskId = c.TaskCounter.value
+	c.TaskCounter.Inc()
+	c.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	task.Filename = filename
 	file, err := os.Open(task.Filename)
 	if err != nil {
 		log.Fatalf("failed to open file: %v", err)
@@ -49,6 +123,10 @@ func (c *Coordinator) GetMapTask(worker *MapWorker, task *TaskData) error {
 
 	content := string(contentBytes)
 	task.FileContent = content
+	task.NReduce = c.ReduceWorkers
+	task.WorkerId = c.WorkerCounter.value
+	c.WorkerCounter.Inc()
+	c.ActiveMapWorkers.Inc()
 
 	fmt.Printf("assigned file %v", task.Filename)
 	return nil
@@ -71,24 +149,39 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
+	return c.IsReduceCompleted
+}
 
-	// Your code here.
-	if len(c.files) == 0 {
-		ret = true
-	}
+func (c *Coordinator) MarkAllDone(request *GenericRPCRequest, response *GenericRPCRequest) error {
+	c.IsReduceCompleted = true
+	return nil
+}
 
-	return ret
+func (c *Coordinator) IsMapDone(question *GenericRPCRequest, reply *MapDoneReply) error {
+	c.mu.Lock()
+	reply.IsDone = len(c.files) == 0
+	c.mu.Unlock()
+	return nil
 }
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-	// Your code here.
+	mapFiles := make([]mapFile, len(files))
+	for i, name := range files {
+		mapFiles[i] = mapFile{Name: name}
+	}
 
-	c.files = files
+	c := Coordinator{
+		ActiveMapWorkers:   SafeCounter{value: 0},
+		MaxMapWorkers:      10,
+		files:              mapFiles,
+		ReduceWorkers:      nReduce,
+		WorkerCounter:      SafeCounter{value: 1},
+		MapTaskLockTimeout: time.Minute,
+		TaskCounter:        SafeCounter{value: 0},
+	}
 
 	// for _, fn := range files {
 	// 	fmt.Println(fn)
@@ -98,10 +191,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	return &c
 }
 
-func removeByValueFast(slice []string, value string) []string {
+func removeMapFileByName(slice []mapFile, name string) []mapFile {
 	for i, v := range slice {
-		if v == value {
-			// Swap with last element and slice off the last element
+		if v.Name == name {
 			slice[i] = slice[len(slice)-1]
 			return slice[:len(slice)-1]
 		}

@@ -1,12 +1,16 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sort"
+	"sync"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -31,24 +35,34 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-func launch_map(mapf func(string, string) []KeyValue, active_count int ) {
+func launch_reduce(reducef func(string, []string) string, id int) {
+	var kva []KeyValue
+	matches, err := filepath.Glob(fmt.Sprintf("mr-*-%d", id))
+	if err != nil {
+		fmt.Printf("we encountred an error while searching for file")
+		return
+	}
+	for _, filename := range matches {
+		file, err := os.Open(filename)
+		if err != nil {
+			fmt.Printf("unable to open intermediate file %s", filename)
+			continue
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+		file.Close()
 
-}
+	}
 
-// main/mrworker.go calls this function.
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+	sort.Sort(ByKey(kva))
 
-	// Your worker implementation here.
-	active_map_tasks := 0
-	max_map_tasks := 10
-	// Map task worker full loop
-	for active_map_tasks < max_map_tasks && () 
-	task := CallGetMapTask()
-	intermediate := mapf(task.Filename, task.FileContent)
-	sort.Sort(ByKey(intermediate))
-
-	oname := "mr-out-0"
+	oname := fmt.Sprintf("mr-out-%d", id)
 	ofile, _ := os.Create(oname)
 
 	//
@@ -56,24 +70,97 @@ func Worker(mapf func(string, string) []KeyValue,
 	// and print the result to mr-out-0.
 	//
 	i := 0
-	for i < len(intermediate) {
+	for i < len(kva) {
 		j := i + 1
-		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+		for j < len(kva) && kva[j].Key == kva[i].Key {
 			j++
 		}
 		values := []string{}
 		for k := i; k < j; k++ {
-			values = append(values, intermediate[k].Value)
+			values = append(values, kva[k].Value)
 		}
-		output := reducef(intermediate[i].Key, values)
+		output := reducef(kva[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
 
 		i = j
 	}
 
-	CallTaskDone(task)
+	ofile.Close()
+
+}
+
+func launch_map(mapf func(string, string) []KeyValue, task TaskData) {
+	intermediate := mapf(task.Filename, task.FileContent)
+	nReduce := task.NReduce
+
+	bucket := make([][]KeyValue, nReduce)
+	for _, kv := range intermediate {
+		BucketKey := ihash(kv.Key) % nReduce
+		bucket[BucketKey] = append(bucket[BucketKey], kv)
+	}
+	var inames []string
+
+	for idx, bkt := range bucket {
+		tempFile, err := os.CreateTemp("", fmt.Sprintf("mr-temp-%d-%d", task.TaskId, idx))
+		if err != nil {
+			fmt.Print("error while trying to create temp file")
+			return
+		}
+		enc := json.NewEncoder(tempFile)
+		for _, kv := range bkt {
+			err := enc.Encode(&kv)
+			if err != nil {
+				fmt.Print("unable to write intermediage kv to json")
+				return
+			}
+		}
+		tempFile.Close()
+		iname := fmt.Sprintf("mr-%d-%d", task.TaskId, idx)
+		inames = append(inames, iname)
+		os.Rename(tempFile.Name(), iname)
+	}
+	CallTaskDone(task, inames)
+
+}
+
+// main/mrworker.go calls this function.
+func Worker(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
+	var Nreduce int
+	// Your worker implementation here.
+	// Map task worker full loop
+	var wg sync.WaitGroup
+	for !CallMapCompleted() {
+		task := CallGetMapTask()
+		if Nreduce <= 0 {
+			Nreduce = task.NReduce
+		}
+		if task.Filename == "" && task.FileContent == "" {
+			time.Sleep(100 * time.Millisecond) // or 500ms
+
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			launch_map(mapf, task)
+		}()
+	}
+	wg.Wait()
+	id := 0
+	// Reduce tasks worker implementation full loop
+	for id < Nreduce {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			launch_reduce(reducef, id)
+		}(id)
+		id++
+	}
+	wg.Wait()
+	CallMarkAllDone()
 
 }
 
@@ -118,14 +205,35 @@ func CallGetMapTask() TaskData {
 	return task
 }
 
-func CallMapCompleted() bool{
-	ok := call("Coordinator.Done")
+func CallMapCompleted() bool {
+	reply := MapDoneReply{}
+	ok := call("Coordinator.IsMapDone", &GenericRPCRequest{}, &reply)
+	if ok {
+		fmt.Print("all map tasks have been completed")
+	} else {
+		fmt.Print("map completed rpc call failed")
+	}
+	return reply.IsDone
 }
 
-func CallTaskDone(task TaskData) {
+func CallTaskDone(task TaskData, inames []string) {
 	doneReply := CoordinatorReply{}
-	call("Coordinator.WorkerDone", &task, &doneReply)
+	request := WorkerDoneRequest{
+		Task:   task,
+		Inames: inames,
+	}
+	ok := call("Coordinator.WorkerDone", &request, &doneReply)
+	if !ok {
+		fmt.Print("error while callink worker done rpc")
+	}
 
+}
+
+func CallMarkAllDone() {
+	ok := call("Coordinator.MarkAllDone", &GenericRPCRequest{}, &GenericRPCRequest{})
+	if !ok {
+		fmt.Print("error while marking all done")
+	}
 }
 
 // send an RPC request to the coordinator, wait for the response.
