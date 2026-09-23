@@ -19,9 +19,18 @@ type mapFile struct {
 	TaskId     int
 }
 
+type reduceWorker struct {
+	WorkerId  int
+	TaskId    int
+	Started   bool
+	StartedAt time.Time
+	Completed bool
+}
+
 type Coordinator struct {
 	// Your definitions here.
 	files              []mapFile
+	ReduceTracker      []reduceWorker
 	TaskCounter        SafeCounter
 	ActiveMapWorkers   SafeCounter
 	MaxMapWorkers      int
@@ -29,7 +38,7 @@ type Coordinator struct {
 	WorkerCounter      SafeCounter
 	IntermediateFiles  []string
 	MapTaskLockTimeout time.Duration
-	IsReduceCompleted  bool
+	IsAllDone          bool
 	mu                 sync.Mutex
 }
 
@@ -75,32 +84,63 @@ func (c *Coordinator) WorkerDone(request *WorkerDoneRequest, reply *CoordinatorR
 	return nil
 }
 
-func (c *Coordinator) assignMapFile(TaskId int) (string, bool) {
+func (c *Coordinator) ReduceWorkerDone(request *ReduceTask, reply *CoordinatorReply) error {
+	c.mu.Lock()
+	w := &c.ReduceTracker[request.ReducerId]
+	w.Completed = true
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Coordinator) assignMapFile(TaskId int) (string, bool, int) {
 	now := time.Now()
+	for i := range c.files {
+		f := &c.files[i]
+		if f.Locked && now.Sub(f.AcquiredAt) > c.MapTaskLockTimeout {
+			f.AcquiredAt = now
+			return f.Name, true, f.TaskId
+		}
+
+	}
 	for i := range c.files {
 		f := &c.files[i]
 		if !f.Locked {
 			f.Locked = true
 			f.AcquiredAt = now
 			f.TaskId = TaskId
-			return f.Name, true
+			return f.Name, true, f.TaskId
 		}
-		if now.Sub(f.AcquiredAt) > c.MapTaskLockTimeout {
-			f.AcquiredAt = now
-			return f.Name, true
+
+	}
+	return "", false, 0
+}
+
+func (c *Coordinator) getLateCount() int {
+	now := time.Now()
+	var counter int
+	for i := range c.files {
+		f := &c.files[i]
+		if f.Locked && now.Sub(f.AcquiredAt) > c.MapTaskLockTimeout {
+			counter++
+			break
 		}
 	}
-	return "", false
+	return counter
 }
 
 // Get task RPC handler
 func (c *Coordinator) GetMapTask(worker *MapWorker, task *TaskData) error {
+	// Free up worker space by removing late tasks
+	c.mu.Lock()
+	late_count := c.getLateCount()
+	for i := 0; i < late_count; i++ {
+		c.ActiveMapWorkers.Dec()
+	}
 	if c.ActiveMapWorkers.Val() >= c.MaxMapWorkers {
+		c.mu.Unlock()
 		return nil
 	}
-	c.mu.Lock()
-	filename, ok := c.assignMapFile(c.TaskCounter.value)
-	task.TaskId = c.TaskCounter.value
+	filename, ok, taskId := c.assignMapFile(c.TaskCounter.value)
 	c.TaskCounter.Inc()
 	c.mu.Unlock()
 	if !ok {
@@ -125,10 +165,29 @@ func (c *Coordinator) GetMapTask(worker *MapWorker, task *TaskData) error {
 	task.FileContent = content
 	task.NReduce = c.ReduceWorkers
 	task.WorkerId = c.WorkerCounter.value
+	task.TaskId = taskId
 	c.WorkerCounter.Inc()
 	c.ActiveMapWorkers.Inc()
 
 	fmt.Printf("assigned file %v", task.Filename)
+	return nil
+}
+
+func (c *Coordinator) GetReduceTask(request *GenericRPCRequest, task *ReduceTask) error {
+	now := time.Now()
+	rid := -1
+	c.mu.Lock()
+	for i := range len(c.ReduceTracker) {
+		w := &c.ReduceTracker[i]
+		if !w.Started || (!w.Completed && now.Sub(w.StartedAt) > time.Second*10) {
+			rid = w.TaskId
+			w.Started = true
+			w.StartedAt = now
+			break
+		}
+	}
+	c.mu.Unlock()
+	task.ReducerId = rid
 	return nil
 }
 
@@ -149,12 +208,16 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	return c.IsReduceCompleted
-}
+	// matches, err := filepath.Glob("mr-out-*")
+	// if err != nil {
+	// 	panic(fmt.Sprintf("we encountred an error while searching for file: %v", err))
+	// }
+	// if len(matches) == c.ReduceWorkers &&  {
+	// 	return true
+	// }
+	// return false
+	return c.IsAllDone
 
-func (c *Coordinator) MarkAllDone(request *GenericRPCRequest, response *GenericRPCRequest) error {
-	c.IsReduceCompleted = true
-	return nil
 }
 
 func (c *Coordinator) IsMapDone(question *GenericRPCRequest, reply *MapDoneReply) error {
@@ -162,6 +225,22 @@ func (c *Coordinator) IsMapDone(question *GenericRPCRequest, reply *MapDoneReply
 	reply.IsDone = len(c.files) == 0
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *Coordinator) IsReduceCompleted(request *GenericRPCRequest, reply *ReduceDoneReply) error {
+	com := true
+	for _, w := range c.ReduceTracker {
+		if !w.Completed {
+			com = false
+			break
+		}
+	}
+	reply.IsDone = com
+	if com {
+		c.IsAllDone = true
+	}
+	return nil
+
 }
 
 // create a Coordinator.
@@ -172,15 +251,21 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	for i, name := range files {
 		mapFiles[i] = mapFile{Name: name}
 	}
+	reduceTracker := make([]reduceWorker, nReduce)
+	for x := range nReduce {
+		reduceTracker[x] = reduceWorker{TaskId: x}
+	}
 
 	c := Coordinator{
 		ActiveMapWorkers:   SafeCounter{value: 0},
-		MaxMapWorkers:      10,
+		MaxMapWorkers:      8,
 		files:              mapFiles,
 		ReduceWorkers:      nReduce,
 		WorkerCounter:      SafeCounter{value: 1},
-		MapTaskLockTimeout: time.Minute,
+		MapTaskLockTimeout: time.Second * 10,
 		TaskCounter:        SafeCounter{value: 0},
+		ReduceTracker:      reduceTracker,
+		IsAllDone:          false,
 	}
 
 	// for _, fn := range files {

@@ -1,0 +1,6 @@
+*** Starting wc test.
+*** Starting indexer test.
+*** Starting job count test.
+*** Starting early exit test.
+*** Starting crash test.
+*** PASSED ALL TESTS

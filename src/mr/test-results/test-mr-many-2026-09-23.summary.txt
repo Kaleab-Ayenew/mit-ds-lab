@@ -1,0 +1,21 @@
+*** Starting wc test.
+*** Starting indexer test.
+*** Starting map parallelism test.
+*** Starting reduce parallelism test.
+*** Starting job count test.
+*** Starting early exit test.
+*** Starting crash test.
+*** PASSED ALL TESTS
+*** Starting wc test.
+*** Starting indexer test.
+*** Starting job count test.
+*** Starting crash test.
+*** PASSED ALL TESTS
+*** Starting wc test.
+*** Starting indexer test.
+*** Starting reduce parallelism test.
+*** Starting job count test.
+*** Starting early exit test.
+*** Starting crash test.
+*** PASSED ALL TESTS
+*** PASSED ALL 3 TESTING TRIALS

@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"sync"
 	"time"
 )
 
@@ -61,10 +60,11 @@ func launch_reduce(reducef func(string, []string) string, id int) {
 	}
 
 	sort.Sort(ByKey(kva))
-
-	oname := fmt.Sprintf("mr-out-%d", id)
-	ofile, _ := os.Create(oname)
-
+	tempFile, err := os.CreateTemp("", fmt.Sprintf("mr-out-temp-%d", id))
+	if err != nil {
+		fmt.Print("error while trying to create temp file")
+		return
+	}
 	//
 	// call Reduce on each distinct key in intermediate[],
 	// and print the result to mr-out-0.
@@ -82,13 +82,15 @@ func launch_reduce(reducef func(string, []string) string, id int) {
 		output := reducef(kva[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+		fmt.Fprintf(tempFile, "%v %v\n", kva[i].Key, output)
 
 		i = j
 	}
 
-	ofile.Close()
-
+	tempFile.Close()
+	oname := fmt.Sprintf("mr-out-%d", id)
+	os.Rename(tempFile.Name(), oname)
+	CallReduceTaskDone(id)
 }
 
 func launch_map(mapf func(string, string) []KeyValue, task TaskData) {
@@ -131,7 +133,6 @@ func Worker(mapf func(string, string) []KeyValue,
 	var Nreduce int
 	// Your worker implementation here.
 	// Map task worker full loop
-	var wg sync.WaitGroup
 	for !CallMapCompleted() {
 		task := CallGetMapTask()
 		if Nreduce <= 0 {
@@ -142,52 +143,22 @@ func Worker(mapf func(string, string) []KeyValue,
 
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		// wg.Add(1)
+		func() {
+			// defer wg.Done()
 			launch_map(mapf, task)
 		}()
 	}
-	wg.Wait()
-	id := 0
+	// wg.Wait()
+
 	// Reduce tasks worker implementation full loop
-	for id < Nreduce {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			launch_reduce(reducef, id)
-		}(id)
-		id++
-	}
-	wg.Wait()
-	CallMarkAllDone()
-
-}
-
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+	for !CallReduceCompleted() {
+		task := CallGetReduceTask()
+		if task.ReducerId == -1 {
+			time.Sleep(100 * time.Millisecond) // or 500ms
+			continue
+		}
+		launch_reduce(reducef, task.ReducerId)
 	}
 }
 
@@ -205,6 +176,17 @@ func CallGetMapTask() TaskData {
 	return task
 }
 
+func CallGetReduceTask() ReduceTask {
+	task := ReduceTask{}
+	ok := call("Coordinator.GetReduceTask", &GenericRPCRequest{}, &task)
+	if ok {
+		fmt.Println("got a reduce task", task.ReducerId)
+	} else {
+		fmt.Printf(("rpc call failed for get reduce task!\n"))
+	}
+	return task
+}
+
 func CallMapCompleted() bool {
 	reply := MapDoneReply{}
 	ok := call("Coordinator.IsMapDone", &GenericRPCRequest{}, &reply)
@@ -216,6 +198,18 @@ func CallMapCompleted() bool {
 	return reply.IsDone
 }
 
+func CallReduceCompleted() bool {
+	reply := ReduceDoneReply{}
+	ok := call("Coordinator.IsReduceCompleted", &GenericRPCRequest{}, &reply)
+	if ok {
+		fmt.Print("all reduce tasks have been completed")
+	} else {
+		fmt.Print("map completed rpc call failed")
+	}
+	return reply.IsDone
+
+}
+
 func CallTaskDone(task TaskData, inames []string) {
 	doneReply := CoordinatorReply{}
 	request := WorkerDoneRequest{
@@ -223,6 +217,18 @@ func CallTaskDone(task TaskData, inames []string) {
 		Inames: inames,
 	}
 	ok := call("Coordinator.WorkerDone", &request, &doneReply)
+	if !ok {
+		fmt.Print("error while callink worker done rpc")
+	}
+
+}
+
+func CallReduceTaskDone(taskid int) {
+	doneReply := CoordinatorReply{}
+	request := ReduceTask{
+		ReducerId: taskid,
+	}
+	ok := call("Coordinator.ReduceWorkerDone", &request, &doneReply)
 	if !ok {
 		fmt.Print("error while callink worker done rpc")
 	}
