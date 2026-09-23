@@ -32,11 +32,31 @@ type MapWorker struct {
 type CoordinatorReply struct {
 }
 
+type GenericRPCRequest struct {
+}
+
 type MapDoneReply struct {
+	IsDone bool
+}
+
+type ReduceDoneReply struct {
+	IsDone bool
 }
 type TaskData struct {
+	TaskId      int
+	WorkerId    int
+	NReduce     int
 	Filename    string
 	FileContent string
+}
+
+type ReduceTask struct {
+	ReducerId int
+}
+
+type WorkerDoneRequest struct {
+	Task   TaskData
+	Inames []string
 }
 
 // Cook up a unique-ish UNIX-domain socket name
